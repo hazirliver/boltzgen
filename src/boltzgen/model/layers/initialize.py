@@ -1,8 +1,10 @@
 """Utility functions for initializing weights and biases."""
 
 import math
+from functools import lru_cache
 import numpy as np
 import torch
+from scipy import special
 from scipy.stats import truncnorm
 
 
@@ -28,15 +30,38 @@ def _calculate_fan(linear_weight_shape, fan="fan_in"):
     return f
 
 
+@lru_cache(maxsize=1)
+def _trunc_normal_constants():
+    # Match SciPy's central-interval mass expression and arithmetic order.
+    # These distribution constants are independent of shape, scale and RNG.
+    return (
+        truncnorm.std(a=-2, b=2, loc=0, scale=1),
+        special.log_ndtr(-2.0),
+        special.log1p(-special.ndtr(-2.0) - special.ndtr(-2.0)),
+    )
+
+
 def trunc_normal_init_(weights, scale=1.0, fan="fan_in"):
     shape = weights.shape
     f = _calculate_fan(shape, fan)
     scale = scale / max(1, f)
-    a = -2
-    b = 2
-    std = math.sqrt(scale) / truncnorm.std(a=a, b=b, loc=0, scale=1)
+    correction, log_cdf, log_mass = _trunc_normal_constants()
+    std = math.sqrt(scale) / correction
     size = _prod(shape)
-    samples = truncnorm.rvs(a=a, b=b, loc=0, scale=std, size=size)
+    if (std <= 0 or not math.isfinite(std)
+            or not hasattr(special, "logsumexp")):
+        # Older SciPy versions used a different inverse-CDF expression. Keep
+        # their sampler, validation and zero-scale behavior unchanged.
+        samples = truncnorm.rvs(a=-2, b=2, loc=0, scale=std, size=size)
+    else:
+        # SciPy's inverse-CDF sampler, specialized to the fixed [-2, 2]
+        # interval. Preserve its uniform draws and logsumexp reduction; an
+        # algebraically equivalent CDF or logaddexp would round differently.
+        uniform = truncnorm.random_state.uniform(size=size)
+        log_probability = special.logsumexp(
+            [np.full_like(uniform, log_cdf), np.log(uniform) + log_mass], axis=0
+        )
+        samples = special.ndtri_exp(log_probability) * std + 0
     samples = np.reshape(samples, shape)
     with torch.no_grad():
         weights.copy_(torch.tensor(samples, device=weights.device))
